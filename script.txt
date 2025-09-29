@@ -1,0 +1,358 @@
+-- 0) СТВОРЕННЯ СХЕМИ --------------------------------------------------------
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'etl')
+    EXEC('CREATE SCHEMA etl');
+GO
+
+-- 1) ПСЕВДО-ENUMИ -----------------------------------------------------------
+-- У SQL Server немає ENUM, тому заводимо малі довідники з контрольованими значеннями.
+IF OBJECT_ID(N'etl._enum_etf_status', N'U') IS NOT NULL DROP TABLE etl._enum_etf_status;
+IF OBJECT_ID(N'etl._enum_dist_type', N'U')  IS NOT NULL DROP TABLE etl._enum_dist_type;
+IF OBJECT_ID(N'etl._enum_dist_freq', N'U')  IS NOT NULL DROP TABLE etl._enum_dist_freq;
+IF OBJECT_ID(N'etl._enum_sec_type', N'U')   IS NOT NULL DROP TABLE etl._enum_sec_type;
+GO
+
+CREATE TABLE etl._enum_etf_status(
+                                     val NVARCHAR(20) NOT NULL
+                                         CHECK (val IN (N'active',N'inactive',N'liquidated',N'suspended')),
+                                     CONSTRAINT PK__enum_etf_status PRIMARY KEY (val)
+);
+CREATE TABLE etl._enum_dist_type(
+                                    val NVARCHAR(30) NOT NULL
+                                        CHECK (val IN (N'dividend',N'capital_gains',N'return_of_capital',N'interest')),
+                                    CONSTRAINT PK__enum_dist_type PRIMARY KEY (val)
+);
+CREATE TABLE etl._enum_dist_freq(
+                                    val NVARCHAR(20) NOT NULL
+                                        CHECK (val IN (N'monthly',N'quarterly',N'semiannual',N'annual',N'irregular')),
+                                    CONSTRAINT PK__enum_dist_freq PRIMARY KEY (val)
+);
+CREATE TABLE etl._enum_sec_type(
+                                   val NVARCHAR(20) NOT NULL
+                                       CHECK (val IN (N'equity',N'bond')),
+                                   CONSTRAINT PK__enum_sec_type PRIMARY KEY (val)
+);
+GO
+INSERT INTO etl._enum_etf_status VALUES (N'active'),(N'inactive'),(N'liquidated'),(N'suspended');
+INSERT INTO etl._enum_dist_type  VALUES (N'dividend'),(N'capital_gains'),(N'return_of_capital'),(N'interest');
+INSERT INTO etl._enum_dist_freq  VALUES (N'monthly'),(N'quarterly'),(N'semiannual'),(N'annual'),(N'irregular');
+INSERT INTO etl._enum_sec_type   VALUES (N'equity'),(N'bond');
+GO
+
+-- 2) СУТНОСТІ ТА ЗВ’ЯЗКИ ----------------------------------------------------
+
+-- Банк (емітент ETF; власник TopLists)
+IF OBJECT_ID(N'etl.bank', N'U') IS NOT NULL DROP TABLE etl.bank;
+GO
+CREATE TABLE etl.bank(
+                         id      BIGINT IDENTITY(1,1) PRIMARY KEY,
+                         name    NVARCHAR(200) NOT NULL,
+                         swift   NVARCHAR(20)  NOT NULL UNIQUE,
+                         address NVARCHAR(500) NOT NULL
+);
+GO
+
+-- Біржа (ідентифікатор MIC)
+IF OBJECT_ID(N'etl.exchange', N'U') IS NOT NULL DROP TABLE etl.exchange;
+GO
+CREATE TABLE etl.exchange(
+                             id      BIGINT IDENTITY(1,1) PRIMARY KEY,
+                             name    NVARCHAR(200) NOT NULL,
+                             mic     NVARCHAR(20)  NOT NULL UNIQUE,
+                             country NVARCHAR(100) NOT NULL
+);
+GO
+
+-- Валюта
+IF OBJECT_ID(N'etl.currency', N'U') IS NOT NULL DROP TABLE etl.currency;
+GO
+CREATE TABLE etl.currency(
+                             id   BIGINT IDENTITY(1,1) PRIMARY KEY,
+                             code NCHAR(3)  NOT NULL UNIQUE,
+                             name NVARCHAR(100) NOT NULL
+);
+GO
+
+-- ETF (фонд): 1–M від Bank; портфель через Holding; виплати; лістинги; TopLists
+IF OBJECT_ID(N'etl.etf', N'U') IS NOT NULL DROP TABLE etl.etf;
+GO
+CREATE TABLE etl.etf(
+                        id               BIGINT IDENTITY(1,1) PRIMARY KEY,
+                        bank_id          BIGINT NOT NULL REFERENCES etl.bank(id),   -- Банк випускає багато ETF
+                        top_fund_name    NVARCHAR(250) NOT NULL,
+                        top_fund_ticker  NVARCHAR(64)  NULL,
+                        effective_date   DATE          NOT NULL,
+                        status           NVARCHAR(20)  NOT NULL REFERENCES etl._enum_etf_status(val),
+                        nav              DECIMAL(18,6) NULL,
+                        mer              DECIMAL(7,4)  NULL,
+                        fact_url         NVARCHAR(1000) NULL                         -- «поточний» журнал обліку
+);
+GO
+
+-- Distribution (виплати/розподіли) — 1–M від ETF
+IF OBJECT_ID(N'etl.distribution', N'U') IS NOT NULL DROP TABLE etl.distribution;
+GO
+CREATE TABLE etl.distribution(
+                                 id               BIGINT IDENTITY(1,1) PRIMARY KEY,
+                                 etf_id           BIGINT NOT NULL REFERENCES etl.etf(id) ON DELETE CASCADE,
+                                 record_date      DATE NOT NULL,
+                                 ex_date          DATE NOT NULL,
+                                 pay_date         DATE NOT NULL,
+                                 amount_per_share DECIMAL(18,8) NOT NULL CHECK (amount_per_share >= 0),
+                                 dist_type        NVARCHAR(30)  NOT NULL REFERENCES etl._enum_dist_type(val),
+                                 dist_freq        NVARCHAR(20)  NOT NULL REFERENCES etl._enum_dist_freq(val),
+                                 CHECK (record_date <= ex_date AND ex_date <= pay_date)       -- природний порядок дат
+);
+GO
+
+-- Надсутність Security (інструменти портфеля/індексів)
+IF OBJECT_ID(N'etl.security', N'U') IS NOT NULL DROP TABLE etl.security;
+GO
+CREATE TABLE etl.security(
+                             id         BIGINT IDENTITY(1,1) PRIMARY KEY,
+                             isin       NVARCHAR(20) NULL UNIQUE,
+                             cusip      NVARCHAR(20) NULL UNIQUE,
+                             sedol      NVARCHAR(20) NULL UNIQUE,
+                             top_fmc_id NVARCHAR(64) NULL,
+                             name       NVARCHAR(250) NOT NULL,
+                             sec_type   NVARCHAR(20)  NOT NULL REFERENCES etl._enum_sec_type(val)
+);
+GO
+
+-- Підтипи Security 1:1 — реалізують ISA (диз’юнктну, повну)
+IF OBJECT_ID(N'etl.equity_security', N'U') IS NOT NULL DROP TABLE etl.equity_security;
+IF OBJECT_ID(N'etl.bond_security',   N'U') IS NOT NULL DROP TABLE etl.bond_security;
+GO
+CREATE TABLE etl.equity_security(
+                                    id      BIGINT NOT NULL PRIMARY KEY REFERENCES etl.security(id) ON DELETE CASCADE,
+                                    name    NVARCHAR(40) NULL
+);
+CREATE TABLE etl.bond_security(
+                                  id            BIGINT NOT NULL PRIMARY KEY REFERENCES etl.security(id) ON DELETE CASCADE,
+                                  coupon        DECIMAL(9,6) NULL,
+                                  maturity_date DATE         NULL,
+                                  rating        NVARCHAR(40) NULL
+);
+GO
+
+-- HOLDING (сильна сутність): портфельні позиції фондів; self 1–N «складається з»
+IF OBJECT_ID(N'etl.holding', N'U') IS NOT NULL DROP TABLE etl.holding;
+GO
+CREATE TABLE etl.holding(
+                            id                 BIGINT IDENTITY(1,1) PRIMARY KEY,
+                            fund_id            BIGINT NOT NULL REFERENCES etl.etf(id) ON DELETE CASCADE,
+                            security_id        BIGINT NOT NULL REFERENCES etl.security(id),
+                            market_value_local DECIMAL(20,6) NOT NULL CHECK (market_value_local >= 0),
+                            market_value_base  DECIMAL(20,6) NOT NULL CHECK (market_value_base  >= 0),
+                            units              DECIMAL(28,12) NOT NULL CHECK (units >= 0),
+                            parent_holding_id  BIGINT NULL REFERENCES etl.holding(id)        -- self-зв’язок (агрегація)
+);
+GO
+
+-- Index (бенчмарк)
+IF OBJECT_ID(N'etl.idx', N'U') IS NOT NULL DROP TABLE etl.idx;
+GO
+CREATE TABLE etl.idx(
+                        id       BIGINT IDENTITY(1,1) PRIMARY KEY,
+                        name     NVARCHAR(200) NOT NULL,
+                        provider NVARCHAR(200) NOT NULL
+);
+GO
+
+-- IndexConstituent (СЛАБКА): входження паперу до індексу на дату
+IF OBJECT_ID(N'etl.index_constituent', N'U') IS NOT NULL DROP TABLE etl.index_constituent;
+GO
+CREATE TABLE etl.index_constituent(
+                                      index_id      BIGINT NOT NULL REFERENCES etl.idx(id) ON DELETE CASCADE,
+                                      security_id   BIGINT NOT NULL REFERENCES etl.security(id),
+                                      as_of_date    DATE   NOT NULL,
+                                      target_weight DECIMAL(10,6) NOT NULL CHECK (target_weight >= 0 AND target_weight <= 1),
+                                      CONSTRAINT PK_index_constituent PRIMARY KEY (index_id, security_id, as_of_date)
+);
+GO
+
+-- TopList (публікація банку із переліком фондів)
+IF OBJECT_ID(N'etl.toplist', N'U') IS NOT NULL DROP TABLE etl.toplist;
+GO
+CREATE TABLE etl.toplist(
+                            id           BIGINT IDENTITY(1,1) PRIMARY KEY,
+                            bank_id      BIGINT NOT NULL REFERENCES etl.bank(id) ON DELETE CASCADE,
+                            name         NVARCHAR(250) NOT NULL,
+                            published_at DATE NOT NULL,
+                            notes        NVARCHAR(1000) NULL
+);
+GO
+
+-- TopListItem (СЛАБКА): включення фонду до списку + ранг
+IF OBJECT_ID(N'etl.toplist_item', N'U') IS NOT NULL DROP TABLE etl.toplist_item;
+GO
+CREATE TABLE etl.toplist_item(
+                                 toplist_id BIGINT NOT NULL REFERENCES etl.toplist(id) ON DELETE CASCADE,
+                                 fund_id    BIGINT NOT NULL REFERENCES etl.etf(id)     ON DELETE CASCADE,
+                                 rank       INT    NOT NULL CHECK (rank > 0),
+                                 category   NVARCHAR(100) NULL,
+                                 CONSTRAINT PK_toplist_item PRIMARY KEY (toplist_id, fund_id),   -- композиційний PK (слабка)
+                                 CONSTRAINT UQ_toplistitem_rank UNIQUE (toplist_id, rank)        -- унікальний ранг у межах списку
+);
+GO
+
+-- Listing (тернарний): ETF × Exchange × Currency + атрибути (ticker, is_primary)
+IF OBJECT_ID(N'etl.listing', N'U') IS NOT NULL DROP TABLE etl.listing;
+GO
+CREATE TABLE etl.listing(
+                            fund_id     BIGINT NOT NULL REFERENCES etl.etf(id) ON DELETE CASCADE,
+                            exchange_id BIGINT NOT NULL REFERENCES etl.exchange(id),
+                            currency_id BIGINT NOT NULL REFERENCES etl.currency(id),
+                            ticker      NVARCHAR(64) NOT NULL,                  -- тикер лістингу на біржі
+                            is_primary  BIT NOT NULL CONSTRAINT DF_listing_is_primary DEFAULT(0),
+                            CONSTRAINT PK_listing PRIMARY KEY (fund_id, exchange_id, currency_id),
+                            CONSTRAINT UQ_listing_exchange_ticker UNIQUE (exchange_id, ticker) -- тікер унікальний на біржі
+);
+GO
+
+-- «Рівно один primary-listing на фонд» — фільтрований UNIQUE-індекс
+CREATE UNIQUE INDEX IX_listing_one_primary_per_fund
+    ON etl.listing(fund_id)
+    WHERE is_primary = 1;
+GO
+
+-- Індекси по зовнішніх ключах (продуктивність JOIN-ів)
+CREATE INDEX IX_etf_bank_id          ON etl.etf(bank_id);
+CREATE INDEX IX_distribution_etf_id  ON etl.distribution(etf_id);
+CREATE INDEX IX_holding_fund_id      ON etl.holding(fund_id);
+CREATE INDEX IX_holding_security_id  ON etl.holding(security_id);
+CREATE INDEX IX_holding_parent_id    ON etl.holding(parent_holding_id);
+CREATE INDEX IX_index_const_idx_date ON etl.index_constituent(index_id, as_of_date);
+CREATE INDEX IX_toplist_bank_id      ON etl.toplist(bank_id);
+CREATE INDEX IX_toplist_item_toplist ON etl.toplist_item(toplist_id);
+CREATE INDEX IX_toplist_item_fund    ON etl.toplist_item(fund_id);
+GO
+
+/*
+      Перевіряє дві умови:
+        (а) parent_holding_id (якщо заданий) вказує на holding того самого fund_id;
+        (б) відсутні цикли у self-ієрархії (ancestor ніколи не дорівнює child).
+*/
+CREATE TRIGGER etl.trg_holding_guard
+    ON etl.holding
+    AFTER INSERT, UPDATE
+    AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ----------------------------------------------------------------------
+    -- (а) "Parent і Child у ТОМУ Ж фонді"
+    -- Якщо parent_holding_id не NULL, то fund_id(parent) має дорівнювати fund_id(child).
+    ----------------------------------------------------------------------
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        WHERE i.parent_holding_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM etl.holding p
+            WHERE p.id = i.parent_holding_id
+              AND p.fund_id <> i.fund_id
+        )
+    )
+        BEGIN
+            RAISERROR (N'Child holding must have parent in the same fund.', 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END;
+
+    ----------------------------------------------------------------------
+    -- Швидкий запобіжник: пряма самопосилка (child == parent)
+    ----------------------------------------------------------------------
+    IF EXISTS (SELECT 1 FROM inserted WHERE parent_holding_id = id)
+        BEGIN
+            RAISERROR (N'Holding cannot be parent of itself.', 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END;
+
+    ----------------------------------------------------------------------
+    -- (б) "Заборона циклів" у self-ієрархії parent_holding_id
+    -- Ідея: стартуємо від безпосереднього parent і піднімаємося вгору,
+    -- поки не дійдемо NULL. Якщо по дорозі зустрінемо child_id → цикл.
+    -- ВАЖЛИВО: CTE має відразу передувати ОДНІЙ команді, тож
+    -- пишемо SELECT, який встановить прапорець @cycle = 1, якщо цикл є.
+    ----------------------------------------------------------------------
+    DECLARE @cycle BIT = 0;
+
+    ;WITH Parents AS (
+        -- Перший "крок вгору": беремо parent для кожного вставленого/оновленого рядка
+        SELECT i.id AS child_id, p.parent_holding_id AS ancestor
+        FROM inserted i
+                 LEFT JOIN etl.holding p ON p.id = i.parent_holding_id
+
+        UNION ALL
+
+        -- Кроки вгору по ланцюгу parent_holding_id → ancestor → ancestor.parent → ...
+        SELECT pr.child_id, h.parent_holding_id
+        FROM Parents pr
+                 JOIN etl.holding h ON h.id = pr.ancestor
+        WHERE pr.ancestor IS NOT NULL
+    )
+     SELECT TOP (1) @cycle = 1
+     FROM Parents
+     WHERE ancestor = child_id             -- якщо коли-небудь вгору дійшли до child → маємо цикл
+     OPTION (MAXRECURSION 1000);           -- ліміт глибини, щоб уникати нескінченностей
+
+    IF @cycle = 1
+        BEGIN
+            RAISERROR (N'Cycle detected in holding self-hierarchy.', 16, 1);
+            ROLLBACK TRANSACTION;
+            RETURN;
+        END;
+END;
+GO
+
+
+/* =========================================================================
+   Демонстрація зв’язків без порушення правил/тригерів.
+   ========================================================================= */
+
+-- Банк, біржа, валюта
+INSERT INTO etl.bank(name,swift,address) VALUES (N'Cdn Bank',N'CDNBBCA1',N'Toronto, ON');
+INSERT INTO etl.exchange(name,mic,country) VALUES (N'TSX',N'XTSE',N'CA');
+INSERT INTO etl.currency(code,name) VALUES (N'CAD',N'Canadian Dollar');
+
+-- ETF
+INSERT INTO etl.etf(bank_id,top_fund_name,effective_date,status,nav,mer,fact_url)
+VALUES (1,N'Cdn Total Market','2020-01-01',N'active',100.12,0.0600,N'https://bank.example/factsheet/ctm');
+
+-- Тернарний лістинг із тикером і primary-прапорцем
+INSERT INTO etl.listing(fund_id,exchange_id,currency_id,ticker,is_primary)
+VALUES (1,1,1,N'CTM',1);
+
+-- Виплата
+INSERT INTO etl.distribution(etf_id,record_date,ex_date,pay_date,amount_per_share,dist_type,dist_freq)
+VALUES (1,'2024-12-20','2024-12-23','2024-12-30',0.245,N'dividend',N'quarterly');
+
+-- Цінні папери + підтипи
+INSERT INTO etl.security(isin,cusip,sedol,top_fmc_id,name,sec_type)
+VALUES (N'ISIN0001',N'CUSIP001',N'SEDOL01',N'PRV1',N'ACME Corp',N'equity'),
+       (N'ISIN0002',N'CUSIP002',N'SEDOL02',N'PRV2',N'Gov Bond 2030',N'bond');
+INSERT INTO etl.equity_security(id) VALUES (1);
+INSERT INTO etl.bond_security(id,coupon,maturity_date,rating) VALUES (2,0.035,'2030-06-30',N'AA');
+
+-- Холдинги: A — батько, B — дочірній; обидва у фонді #1
+INSERT INTO etl.holding(fund_id,security_id,market_value_local,market_value_base,units,parent_holding_id)
+VALUES (1,1,100000,100000,1000,NULL);
+DECLARE @A BIGINT = SCOPE_IDENTITY();
+
+INSERT INTO etl.holding(fund_id,security_id,market_value_local,market_value_base,units,parent_holding_id)
+VALUES (1,2,50000,50000,600,@A);
+DECLARE @B BIGINT = SCOPE_IDENTITY();
+
+-- Індекс і його склад (слабка сутність із комп. PK)
+INSERT INTO etl.idx(name,provider) VALUES (N'S&P Canada Broad',N'S&P');
+INSERT INTO etl.index_constituent(index_id,security_id,as_of_date,target_weight)
+VALUES (1,1,'2025-01-01',0.060000),
+       (1,2,'2025-01-01',0.040000);
+
+-- Рейтинговий список і елемент рейтингу (слабка сутність)
+INSERT INTO etl.toplist(bank_id,name,published_at,notes)
+VALUES (1,N'Top Funds — Jan 2025','2025-01-15',N'Income & Broad Market');
+INSERT INTO etl.toplist_item(toplist_id,fund_id,rank,category)
+VALUES (1,1,1,N'Broad Market');
