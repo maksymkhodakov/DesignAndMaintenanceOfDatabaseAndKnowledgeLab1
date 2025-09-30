@@ -227,11 +227,31 @@ CREATE INDEX IX_toplist_item_toplist ON etl.toplist_item(toplist_id);
 CREATE INDEX IX_toplist_item_fund    ON etl.toplist_item(fund_id);
 GO
 
-/*
-      Перевіряє дві умови:
-        (а) parent_holding_id (якщо заданий) вказує на holding того самого fund_id;
-        (б) відсутні цикли у self-ієрархії (ancestor ніколи не дорівнює child).
-*/
+/* =====================================================================================
+     Тригер замикає дві інваріантні умови на ієрархії портфельних позицій (holding):
+       (1) Якщо для дочірнього холдингу задано parent_holding_id, то БАТЬКО МАЄ
+           НАЛЕЖАТИ ТОМУ Ж ФОНДУ (fund_id), що й дитина.
+       (2) У self-ієрархії holding НЕ МОЖЕ ВИНИКАТИ ЖОДНИХ ЦИКЛІВ (у т.ч. прямий
+           self-reference). Будь-який шлях угору по parent_holding_id не повинен
+           повертати нас до початкового child.
+
+   ЧОМУ ЦЕ НЕ CHECK/FOREIGN KEY:
+     - Правило (1) порівнює fund_id між ДВОМА РЯДКАМИ тієї ж таблиці (child vs parent),
+       чого не виразити звичайним CHECK.
+     - Правило (2) — це відсутність циклів у рекурсивному графі; це класичний кейс для
+       тригера або контрольної логіки на етапі завантаження.
+
+   ЯК ПРАЦЮЄ (АЛГОРИТМ):
+     - Швидкий фільтр ловить заборонені «перетинання фондів» між child і parent.
+     - Окремий фільтр ловить пряме самопосилання (child == parent) із чітким меседжем.
+     - Рекурсивний CTE «Parents» для КОЖНОГО рядка з inserted стартує від його
+       безпосереднього parent і підіймається вгору по ланцюгу parent_holding_id,
+       доки не дійде NULL. Якщо на будь-якому кроці ancestor збігається з child_id,
+       знайдено цикл — піднімаємо помилку.
+     - MAXRECURSION=1000 — страховка від безмежного сходження у випадку дуже
+       глибоких дерев або вже існуючих циклів.
+===================================================================================== */
+
 CREATE TRIGGER etl.trg_holding_guard
     ON etl.holding
     AFTER INSERT, UPDATE
@@ -240,8 +260,9 @@ BEGIN
     SET NOCOUNT ON;
 
     ----------------------------------------------------------------------
-    -- (а) "Parent і Child у ТОМУ Ж фонді"
-    -- Якщо parent_holding_id не NULL, то fund_id(parent) має дорівнювати fund_id(child).
+    -- (1) «Parent і child у ТОМУ Ж фонді»
+    -- Якщо в inserted зʼявився/змінився parent_holding_id, переконуємося,
+    -- що fund_id(parent) == fund_id(child). Інакше — бізнес-порушення.
     ----------------------------------------------------------------------
     IF EXISTS (
         SELECT 1
@@ -261,7 +282,8 @@ BEGIN
         END;
 
     ----------------------------------------------------------------------
-    -- Швидкий запобіжник: пряма самопосилка (child == parent)
+    -- (2a) Швидкий запобіжник: пряме самопосилання (child == parent).
+    -- Це приватний випадок циклу, але окремий меседж допомагає діагностиці.
     ----------------------------------------------------------------------
     IF EXISTS (SELECT 1 FROM inserted WHERE parent_holding_id = id)
         BEGIN
@@ -271,23 +293,25 @@ BEGIN
         END;
 
     ----------------------------------------------------------------------
-    -- (б) "Заборона циклів" у self-ієрархії parent_holding_id
-    -- Ідея: стартуємо від безпосереднього parent і піднімаємося вгору,
-    -- поки не дійдемо NULL. Якщо по дорозі зустрінемо child_id → цикл.
-    -- ВАЖЛИВО: CTE має відразу передувати ОДНІЙ команді, тож
-    -- пишемо SELECT, який встановить прапорець @cycle = 1, якщо цикл є.
+    -- (2b) Загальна «Заборона циклів» у self-ієрархії parent_holding_id.
+    -- Ідея: для кожного рядка з inserted піднімаємося вгору по ланцюгу
+    -- parent_holding_id → parent.parent_holding_id → ... до NULL. Якщо на
+    -- будь-якому рівні ancestor == child_id → маємо цикл.
+    -- рекурсивний CTE має безпосередньо передувати
+    -- одній команді. Тому ми робимо SELECT, який встановлює @cycle = 1,
+    -- якщо знайдено хоча б один такий випадок.
     ----------------------------------------------------------------------
     DECLARE @cycle BIT = 0;
 
     ;WITH Parents AS (
-        -- Перший "крок вгору": беремо parent для кожного вставленого/оновленого рядка
+        -- Перший крок: беремо безпосередніх батьків для всіх вставлених/оновлених
         SELECT i.id AS child_id, p.parent_holding_id AS ancestor
         FROM inserted i
                  LEFT JOIN etl.holding p ON p.id = i.parent_holding_id
 
         UNION ALL
 
-        -- Кроки вгору по ланцюгу parent_holding_id → ancestor → ancestor.parent → ...
+        -- Далі «піднімаємося» по ланцюгу ancestor → ancestor.parent → ...
         SELECT pr.child_id, h.parent_holding_id
         FROM Parents pr
                  JOIN etl.holding h ON h.id = pr.ancestor
@@ -295,8 +319,8 @@ BEGIN
     )
      SELECT TOP (1) @cycle = 1
      FROM Parents
-     WHERE ancestor = child_id             -- якщо коли-небудь вгору дійшли до child → маємо цикл
-     OPTION (MAXRECURSION 1000);           -- ліміт глибини, щоб уникати нескінченностей
+     WHERE ancestor = child_id          -- повернулися до стартового child → цикл
+     OPTION (MAXRECURSION 1000);        -- обмеження глибини (регульоване)
 
     IF @cycle = 1
         BEGIN
@@ -306,6 +330,15 @@ BEGIN
         END;
 END;
 GO
+
+
+/* ====================== метадані трігера ====================== */
+SELECT t.name AS trigger_name,
+       OBJECT_SCHEMA_NAME(t.parent_id) AS table_schema,
+       OBJECT_NAME(t.parent_id)        AS table_name,
+       t.is_disabled
+FROM sys.triggers t
+WHERE t.name = N'trg_holding_guard';
 
 
 /* =========================================================================
