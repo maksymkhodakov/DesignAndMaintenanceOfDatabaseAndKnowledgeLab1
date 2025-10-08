@@ -104,22 +104,6 @@ CREATE TABLE etl.distribution(
 );
 GO
 
--- Підтипи Security 1:1 — реалізують ISA (диз’юнктну, повну)
-IF OBJECT_ID(N'etl.equity_security', N'U') IS NOT NULL DROP TABLE etl.equity_security;
-IF OBJECT_ID(N'etl.bond_security',   N'U') IS NOT NULL DROP TABLE etl.bond_security;
-GO
-CREATE TABLE etl.equity_security(
-                                    id              BIGINT IDENTITY(1,1) PRIMARY KEY,
-                                    name            NVARCHAR(40) NULL
-);
-CREATE TABLE etl.bond_security(
-                                  id            BIGINT IDENTITY(1,1) PRIMARY KEY,
-                                  coupon        DECIMAL(9,6) NULL,
-                                  maturity_date DATE         NULL,
-                                  rating        NVARCHAR(40) NULL
-);
-GO
-
 -- Надсутність Security (інструменти портфеля/індексів)
 IF OBJECT_ID(N'etl.security', N'U') IS NOT NULL DROP TABLE etl.security;
 GO
@@ -130,9 +114,23 @@ CREATE TABLE etl.security(
                              sedol                  NVARCHAR(20) NULL UNIQUE,
                              top_fmc_id             NVARCHAR(64) NULL,
                              name                   NVARCHAR(250) NOT NULL,
-                             sec_type               NVARCHAR(20)  NOT NULL REFERENCES etl._enum_sec_type(val),
-                             equity_security_id     BIGINT REFERENCES etl.equity_security(id),
-                             bond_security_id       BIGINT REFERENCES etl.bond_security(id),
+                             sec_type               NVARCHAR(20)  NOT NULL REFERENCES etl._enum_sec_type(val)
+);
+GO
+
+-- Підтипи Security 1:1 — реалізують ISA (диз’юнктну, повну)
+IF OBJECT_ID(N'etl.equity_security', N'U') IS NOT NULL DROP TABLE etl.equity_security;
+IF OBJECT_ID(N'etl.bond_security',   N'U') IS NOT NULL DROP TABLE etl.bond_security;
+GO
+CREATE TABLE etl.equity_security(
+                                    id              BIGINT NOT NULL PRIMARY KEY REFERENCES etl.security(id) ON DELETE CASCADE,
+                                    name            NVARCHAR(40) NULL
+);
+CREATE TABLE etl.bond_security(
+                                  id            BIGINT NOT NULL PRIMARY KEY REFERENCES etl.security(id) ON DELETE CASCADE,
+                                  coupon        DECIMAL(9,6) NULL,
+                                  maturity_date DATE         NULL,
+                                  rating        NVARCHAR(40) NULL
 );
 GO
 
@@ -188,12 +186,10 @@ GO
 IF OBJECT_ID(N'etl.toplist_item', N'U') IS NOT NULL DROP TABLE etl.toplist_item;
 GO
 CREATE TABLE etl.toplist_item(
+                                 id         BIGINT IDENTITY(1,1) PRIMARY KEY,
                                  toplist_id BIGINT NOT NULL REFERENCES etl.toplist(id) ON DELETE CASCADE,
-                                 fund_id    BIGINT NOT NULL REFERENCES etl.etf(id)     ON DELETE CASCADE,
                                  rank       INT    NOT NULL CHECK (rank > 0),
-                                 category   NVARCHAR(100) NULL,
-                                 CONSTRAINT PK_toplist_item PRIMARY KEY (toplist_id, fund_id),   -- композиційний PK (слабка)
-                                 CONSTRAINT UQ_toplistitem_rank UNIQUE (toplist_id, rank)        -- унікальний ранг у межах списку
+                                 category   NVARCHAR(100) NULL
 );
 GO
 
@@ -226,7 +222,6 @@ CREATE INDEX IX_holding_parent_id    ON etl.holding(parent_holding_id);
 CREATE INDEX IX_index_const_idx_date ON etl.index_constituent(index_id, as_of_date);
 CREATE INDEX IX_toplist_bank_id      ON etl.toplist(bank_id);
 CREATE INDEX IX_toplist_item_toplist ON etl.toplist_item(toplist_id);
-CREATE INDEX IX_toplist_item_fund    ON etl.toplist_item(fund_id);
 GO
 
 /* =====================================================================================
@@ -362,11 +357,11 @@ INSERT INTO etl.distribution(etf_id,record_date,ex_date,pay_date,amount_per_shar
 VALUES (1,'2024-12-20','2024-12-23','2024-12-30',0.245,N'dividend',N'quarterly');
 
 -- Цінні папери + підтипи
-INSERT INTO etl.equity_security(name) VALUES (N'equity_name');
-INSERT INTO etl.bond_security(coupon,maturity_date,rating) VALUES (0.035,'2030-06-30',N'AA');
-INSERT INTO etl.security(isin,cusip,sedol,top_fmc_id,name,sec_type, equity_security_id, bond_security_id)
-VALUES (N'ISIN0001',N'CUSIP001',N'SEDOL01',N'PRV1',N'ACME Corp',N'equity', (SELECT id FROM etl.equity_security WHERE name = N'equity_name'), null),
-       (N'ISIN0002',N'CUSIP002',N'SEDOL02',N'PRV2',N'Gov Bond 2030',N'bond', null, (SELECT id FROM etl.bond_security WHERE coupon = 0.035));
+INSERT INTO etl.security(isin,cusip,sedol,top_fmc_id,name,sec_type)
+VALUES (N'ISIN0001',N'CUSIP001',N'SEDOL01',N'PRV1',N'ACME Corp',N'equity'),
+       (N'ISIN0002',N'CUSIP002',N'SEDOL02',N'PRV2',N'Gov Bond 2030',N'bond');
+INSERT INTO etl.equity_security(id) VALUES (1);
+INSERT INTO etl.bond_security(id,coupon,maturity_date,rating) VALUES (2,0.035,'2030-06-30',N'AA');
 
 -- Холдинги: A — батько, B — дочірній; обидва у фонді #1
 INSERT INTO etl.holding(fund_id,security_id,market_value_local,market_value_base,units,parent_holding_id)
@@ -386,5 +381,5 @@ VALUES (1,1,'2025-01-01',0.060000),
 -- Рейтинговий список і елемент рейтингу (слабка сутність)
 INSERT INTO etl.toplist(bank_id,name,published_at,notes)
 VALUES (1,N'Top Funds — Jan 2025','2025-01-15',N'Income & Broad Market');
-INSERT INTO etl.toplist_item(toplist_id,fund_id,rank,category)
-VALUES (1,1,1,N'Broad Market');
+INSERT INTO etl.toplist_item(toplist_id,rank,category)
+VALUES (1,1,N'Broad Market');
