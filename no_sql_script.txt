@@ -1,0 +1,307 @@
+use etl;
+
+// Helpers
+function existsCollection(name) {
+    return db.getCollectionInfos({ name }).length > 0;
+}
+function dropIfExists(name) {
+    if (existsCollection(name)) db.getCollection(name).drop();
+}
+
+// ============================ ENUMS ================================
+db.getCollectionInfos({ name: /^_enum_/ }).forEach(ci => db.getCollection(ci.name).drop());
+
+db.createCollection("_enum_etf_status");
+db.getCollection("_enum_etf_status").createIndex({ val: 1 }, { unique: true, name: "UQ_etf_status" });
+db.getCollection("_enum_etf_status").insertMany([
+    { val: "active" }, { val: "inactive" }, { val: "liquidated" }, { val: "suspended" }
+]);
+
+db.createCollection("_enum_dist_type");
+db.getCollection("_enum_dist_type").createIndex({ val: 1 }, { unique: true, name: "UQ_dist_type" });
+db.getCollection("_enum_dist_type").insertMany([
+    { val: "dividend" }, { val: "capital_gains" }, { val: "return_of_capital" }, { val: "interest" }
+]);
+
+db.createCollection("_enum_dist_freq");
+db.getCollection("_enum_dist_freq").createIndex({ val: 1 }, { unique: true, name: "UQ_dist_freq" });
+db.getCollection("_enum_dist_freq").insertMany([
+    { val: "monthly" }, { val: "quarterly" }, { val: "semiannual" }, { val: "annual" }, { val: "irregular" }
+]);
+
+db.createCollection("_enum_sec_type");
+db.getCollection("_enum_sec_type").createIndex({ val: 1 }, { unique: true, name: "UQ_sec_type" });
+db.getCollection("_enum_sec_type").insertMany([{ val: "equity" }, { val: "bond" }]);
+
+// ============================ BANK ================================
+dropIfExists("bank");
+db.createCollection("bank", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["name","swift","address"],
+            properties: {
+                name:   { bsonType: "string", maxLength: 200 },
+                swift:  { bsonType: "string", maxLength: 20 },
+                address:{ bsonType: "string", maxLength: 500 }
+            } } }});
+db.getCollection("bank").createIndex({ swift: 1 }, { unique: true, name: "UQ_bank_swift" });
+
+// ============================ EXCHANGE ============================
+dropIfExists("exchange");
+db.createCollection("exchange", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["name","mic","country"],
+            properties: {
+                name: { bsonType: "string", maxLength: 200 },
+                mic:  { bsonType: "string", maxLength: 20 },
+                country: { bsonType: "string", maxLength: 100 }
+            } } }});
+db.getCollection("exchange").createIndex({ mic: 1 }, { unique: true, name: "UQ_exchange_mic" });
+
+// ============================ CURRENCY ============================
+dropIfExists("currency");
+db.createCollection("currency", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["code","name"],
+            properties: {
+                code: { bsonType: "string", minLength: 3, maxLength: 3 },
+                name: { bsonType: "string", maxLength: 100 }
+            } } }});
+db.getCollection("currency").createIndex({ code: 1 }, { unique: true, name: "UQ_currency_code" });
+
+// ============================ ETF ================================
+dropIfExists("etf");
+db.createCollection("etf", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["bankId","topFundName","effectiveDate","status"],
+            properties: {
+                bankId: { bsonType: "objectId" },
+                topFundName: { bsonType: "string", maxLength: 250 },
+                topFundTicker:{ bsonType: ["string","null"], maxLength: 64 },
+                effectiveDate: { bsonType: "date" },
+                status: { enum: ["active","inactive","liquidated","suspended"] },
+                nav: { bsonType: ["double","decimal","null"] },
+                mer: { bsonType: ["double","decimal","null"] },
+                factUrl: { bsonType: ["string","null"], maxLength: 1000 }
+            } } }});
+db.getCollection("etf").createIndex({ bankId: 1 }, { name: "IX_etf_bank_id" });
+
+// ============================ DISTRIBUTION =========================
+dropIfExists("distribution");
+db.createCollection("distribution", {
+    validator: { $and: [
+            { $jsonSchema: {
+                    bsonType: "object",
+                    required: ["etfId","recordDate","exDate","payDate","amountPerShare","distType","distFreq"],
+                    properties: {
+                        etfId: { bsonType: "objectId" },
+                        recordDate: { bsonType: "date" },
+                        exDate: { bsonType: "date" },
+                        payDate: { bsonType: "date" },
+                        amountPerShare: { bsonType: ["double","decimal"], minimum: 0 },
+                        distType: { enum: ["dividend","capital_gains","return_of_capital","interest"] },
+                        distFreq: { enum: ["monthly","quarterly","semiannual","annual","irregular"] }
+                    } } },
+            { $expr: { $and: [ { $lte: ["$recordDate","$exDate"] }, { $lte: ["$exDate","$payDate"] } ] } }
+        ] }});
+db.getCollection("distribution").createIndex({ etfId: 1 }, { name: "IX_distribution_etf_id" });
+
+// ============================ SECURITY ============================
+dropIfExists("security");
+db.createCollection("security", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["name","secType"],
+            properties: {
+                isin:  { bsonType: ["string","null"], maxLength: 20 },
+                cusip: { bsonType: ["string","null"], maxLength: 20 },
+                sedol: { bsonType: ["string","null"], maxLength: 20 },
+                topFmcId: { bsonType: ["string","null"], maxLength: 64 },
+                name:  { bsonType: "string", maxLength: 250 },
+                secType: { enum: ["equity","bond"] },
+                equityName: { bsonType: ["string","null"], maxLength: 40 },
+                coupon: { bsonType: ["double","decimal","null"] },
+                maturityDate: { bsonType: ["date","null"] },
+                rating: { bsonType: ["string","null"], maxLength: 40 }
+            },
+            oneOf: [ { properties: { secType: { enum: ["equity"] } } },
+                { properties: { secType: { enum: ["bond"] } } } ]
+        } }});
+db.getCollection("security").createIndex({ isin: 1 }, { unique: true, sparse: true, name: "UQ_security_isin" });
+db.getCollection("security").createIndex({ cusip: 1 }, { unique: true, sparse: true, name: "UQ_security_cusip" });
+db.getCollection("security").createIndex({ sedol: 1 }, { unique: true, sparse: true, name: "UQ_security_sedol" });
+
+// ============================ HOLDING =============================
+dropIfExists("holding");
+db.createCollection("holding", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["fundId","securityId","marketValueLocal","marketValueBase","units"],
+            properties: {
+                fundId: { bsonType: "objectId" },
+                securityId: { bsonType: "objectId" },
+                marketValueLocal: { bsonType: ["double","decimal"], minimum: 0 },
+                marketValueBase:  { bsonType: ["double","decimal"], minimum: 0 },
+                units:            { bsonType: ["double","decimal"], minimum: 0 },
+                parentHoldingId:  { bsonType: ["objectId","null"] },
+                path:             { bsonType: ["array","null"], items: { bsonType: "objectId" } }
+            } } }});
+db.getCollection("holding").createIndex({ fundId: 1 }, { name: "IX_holding_fund_id" });
+db.getCollection("holding").createIndex({ securityId: 1 }, { name: "IX_holding_security_id" });
+db.getCollection("holding").createIndex({ parentHoldingId: 1 }, { name: "IX_holding_parent_id" });
+db.getCollection("holding").createIndex({ fundId: 1, path: 1 }, { name: "IX_holding_path" });
+
+// ============================ IDX ================================
+dropIfExists("idx");
+db.createCollection("idx", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["name","provider"],
+            properties: {
+                name: { bsonType: "string", maxLength: 200 },
+                provider: { bsonType: "string", maxLength: 200 }
+            } } }});
+
+// ===================== INDEX_CONSTITUENT ==========================
+dropIfExists("index_constituent");
+db.createCollection("index_constituent", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["indexId","securityId","asOfDate","targetWeight"],
+            properties: {
+                indexId:    { bsonType: "objectId" },
+                securityId: { bsonType: "objectId" },
+                asOfDate:   { bsonType: "date" },
+                targetWeight: { bsonType: ["double","decimal"], minimum: 0, maximum: 1 }
+            } } }});
+db.getCollection("index_constituent").createIndex(
+    { indexId: 1, securityId: 1, asOfDate: 1 },
+    { unique: true, name: "PK_index_constituent" }
+);
+db.getCollection("index_constituent").createIndex({ indexId: 1, asOfDate: 1 }, { name: "IX_index_const_idx_date" });
+
+// ============================ TOPLIST =============================
+dropIfExists("toplist");
+db.createCollection("toplist", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["bankId","name","publishedAt"],
+            properties: {
+                bankId: { bsonType: "objectId" },
+                name: { bsonType: "string", maxLength: 250 },
+                publishedAt: { bsonType: "date" },
+                notes: { bsonType: ["string","null"], maxLength: 1000 }
+            } } }});
+db.getCollection("toplist").createIndex({ bankId: 1 }, { name: "IX_toplist_bank_id" });
+
+// ========================= TOPLIST_ITEM ===========================
+dropIfExists("toplist_item");
+db.createCollection("toplist_item", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["toplistId","rank"],
+            properties: {
+                toplistId: { bsonType: "objectId" },
+                rank: { bsonType: "int", minimum: 1 },
+                category: { bsonType: ["string","null"], maxLength: 100 }
+            } } }});
+db.getCollection("toplist_item").createIndex({ toplistId: 1 }, { name: "IX_toplist_item_toplist" });
+
+// ============================ LISTING =============================
+dropIfExists("listing");
+db.createCollection("listing", {
+    validator: { $jsonSchema: {
+            bsonType: "object",
+            required: ["fundId","exchangeId","currencyId","ticker","isPrimary"],
+            properties: {
+                fundId: { bsonType: "objectId" },
+                exchangeId: { bsonType: "objectId" },
+                currencyId: { bsonType: "objectId" },
+                ticker: { bsonType: "string", maxLength: 64 },
+                isPrimary: { bsonType: "bool" }
+            } } }});
+// PK (fund,exchange,currency)
+db.getCollection("listing").createIndex(
+    { fundId: 1, exchangeId: 1, currencyId: 1 },
+    { unique: true, name: "PK_listing" }
+);
+// Unique (exchange, ticker)
+db.getCollection("listing").createIndex(
+    { exchangeId: 1, ticker: 1 },
+    { unique: true, name: "UQ_listing_exchange_ticker" }
+);
+// Exactly one primary per fund (partial unique)
+db.getCollection("listing").createIndex(
+    { fundId: 1 },
+    { unique: true, partialFilterExpression: { isPrimary: true }, name: "IX_listing_one_primary_per_fund" }
+);
+
+// ============================ DEMO DATA ============================
+const bankId     = db.getCollection("bank").insertOne({ name: "Cdn Bank", swift: "CDNBBCA1", address: "Toronto, ON" }).insertedId;
+const exchangeId = db.getCollection("exchange").insertOne({ name: "TSX", mic: "XTSE", country: "CA" }).insertedId;
+const currencyId = db.getCollection("currency").insertOne({ code: "CAD", name: "Canadian Dollar" }).insertedId;
+
+const etfId = db.getCollection("etf").insertOne({
+    bankId,
+    topFundName: "Cdn Total Market",
+    topFundTicker: null,
+    effectiveDate: ISODate("2020-01-01T00:00:00Z"),
+    status: "active",
+    nav: NumberDecimal("100.12"),
+    mer: NumberDecimal("0.0600"),
+    factUrl: "https://bank.example/factsheet/ctm"
+}).insertedId;
+
+db.getCollection("listing").insertOne({ fundId: etfId, exchangeId, currencyId, ticker: "CTM", isPrimary: true });
+
+db.getCollection("distribution").insertOne({
+    etfId,
+    recordDate: ISODate("2024-12-20T00:00:00Z"),
+    exDate:     ISODate("2024-12-23T00:00:00Z"),
+    payDate:    ISODate("2024-12-30T00:00:00Z"),
+    amountPerShare: NumberDecimal("0.245"),
+    distType: "dividend",
+    distFreq: "quarterly"
+});
+
+const secEquityId = db.getCollection("security").insertOne({
+    isin: "ISIN0001", cusip: "CUSIP001", sedol: "SEDOL01", topFmcId: "PRV1",
+    name: "ACME Corp", secType: "equity", equityName: null
+}).insertedId;
+
+const secBondId = db.getCollection("security").insertOne({
+    isin: "ISIN0002", cusip: "CUSIP002", sedol: "SEDOL02", topFmcId: "PRV2",
+    name: "Gov Bond 2030", secType: "bond",
+    coupon: NumberDecimal("0.035"), maturityDate: ISODate("2030-06-30T00:00:00Z"), rating: "AA"
+}).insertedId;
+
+const holdingAId = db.getCollection("holding").insertOne({
+    fundId: etfId, securityId: secEquityId,
+    marketValueLocal: NumberDecimal("100000"), marketValueBase: NumberDecimal("100000"),
+    units: NumberDecimal("1000"), parentHoldingId: null
+}).insertedId;
+
+const holdingBId = db.getCollection("holding").insertOne({
+    fundId: etfId, securityId: secBondId,
+    marketValueLocal: NumberDecimal("50000"), marketValueBase: NumberDecimal("50000"),
+    units: NumberDecimal("600"), parentHoldingId: null
+}).insertedId;
+
+const indexId = db.getCollection("idx").insertOne({ name: "S&P Canada Broad", provider: "S&P" }).insertedId;
+db.getCollection("index_constituent").insertMany([
+    { indexId, securityId: secEquityId, asOfDate: ISODate("2025-01-01T00:00:00Z"), targetWeight: NumberDecimal("0.060000") },
+    { indexId, securityId: secBondId,   asOfDate: ISODate("2025-01-01T00:00:00Z"), targetWeight: NumberDecimal("0.040000") }
+]);
+
+const toplistId = db.getCollection("toplist").insertOne({
+    bankId, name: "Top Funds — Jan 2025",
+    publishedAt: ISODate("2025-01-15T00:00:00Z"),
+    notes: "Income & Broad Market"
+}).insertedId;
+
+db.getCollection("toplist_item").insertOne({ toplistId, rank: 1, category: "Broad Market" });
+
+print("=== MongoDB ETL schema created & demo data inserted ===");
