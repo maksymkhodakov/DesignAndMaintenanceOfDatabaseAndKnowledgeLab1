@@ -305,3 +305,451 @@ const toplistId = db.getCollection("toplist").insertOne({
 db.getCollection("toplist_item").insertOne({ toplistId, rank: 1, category: "Broad Market" });
 
 print("=== MongoDB ETL schema created & demo data inserted ===");
+
+// ============================================================================
+// ======================= CRUD DEMO ========================
+// ============================================================================
+
+// 0. ДОДАТКОВІ ДАНІ, щоб було що показувати
+print("=== EXTRA DEMO DATA ===");
+
+// другий банк
+const bank2Insert = db.getCollection("bank").insertOne({
+    name: "US Global Bank",
+    swift: "USGLOB1",
+    address: "New York, NY"
+});
+const bank2Id = bank2Insert.insertedId;
+print("Inserted bank2: " + bank2Id);
+
+// друга біржа
+const exch2Insert = db.getCollection("exchange").insertOne({
+    name: "NASDAQ",
+    mic: "XNAS",
+    country: "US"
+});
+const exchange2Id = exch2Insert.insertedId;
+print("Inserted exchange2: " + exchange2Id);
+
+// USD валюта (перевіряємо, може вже є)
+let usd = db.getCollection("currency").findOne({ code: "USD" });
+if (!usd) {
+    const usdIns = db.getCollection("currency").insertOne({ code: "USD", name: "US Dollar" });
+    usd = db.getCollection("currency").findOne({ _id: usdIns.insertedId });
+}
+const usdId = usd._id;
+print("USD id: " + usdId);
+
+// другий ETF під другим банком
+const etf2Insert = db.getCollection("etf").insertOne({
+    bankId: bank2Id,
+    topFundName: "US Tech Growth",
+    topFundTicker: "USTG",
+    effectiveDate: ISODate("2021-05-01T00:00:00Z"),
+    status: "active",
+    nav: NumberDecimal("250.55"),
+    mer: NumberDecimal("0.0450"),
+    factUrl: "https://usbank.example/facts/ustg"
+});
+const etf2Id = etf2Insert.insertedId;
+print("Inserted ETF2: " + etf2Id);
+
+// лістинг для ETF2
+db.getCollection("listing").insertOne({
+    fundId: etf2Id,
+    exchangeId: exchange2Id,
+    currencyId: usdId,
+    ticker: "USTG",
+    isPrimary: true
+});
+print("Inserted listing for ETF2");
+
+// ще одна security для вкладених holding'ів
+const secAltInsert = db.getCollection("security").insertOne({
+    isin: "ISIN0003",
+    cusip: "CUSIP003",
+    sedol: "SEDOL03",
+    name: "Alt Energy Inc",
+    secType: "equity",
+    equityName: "ALT"
+});
+const secAltId = secAltInsert.insertedId;
+print("Inserted extra security: " + secAltId);
+
+let baseEtf = db.getCollection("etf").findOne({ topFundName: "Cdn Total Market" });
+
+if (!baseEtf) {
+    baseEtf = db.getCollection("etf").findOne({});
+}
+
+if (baseEtf) {
+    // шукаємо будь-який root-holding для цього фонду
+    const holdingA = db.getCollection("holding").findOne({ fundId: baseEtf._id, parentHoldingId: null });
+
+    if (holdingA) {
+        db.getCollection("holding").insertOne({
+            fundId: baseEtf._id,
+            securityId: secAltId,
+            marketValueLocal: NumberDecimal("12000"),
+            marketValueBase:  NumberDecimal("12000"),
+            units:            NumberDecimal("150"),
+            parentHoldingId:  holdingA._id,
+            path: [ holdingA._id ]
+        });
+        print("Inserted child holding under existing root holding");
+    } else {
+        print("No root holding found for fund " + baseEtf._id + " — child holding not inserted");
+    }
+} else {
+    print("No ETF found at all — child holding not inserted");
+}
+
+// ---------------------------------------------------------------------------
+// 1. CRUD: BANK
+// ---------------------------------------------------------------------------
+print("=== CRUD: BANK ===");
+
+// CREATE
+const tempBankInsert = db.getCollection("bank").insertOne({
+    name: "Temp Demo Bank",
+    swift: "TEMPD1",
+    address: "Demo street 1"
+});
+const tempBankId = tempBankInsert.insertedId;
+print("Inserted temp bank: " + tempBankId);
+
+// READ (усі банки)
+print("All banks:");
+db.getCollection("bank")
+    .find({}, { name: 1, swift: 1, address: 1 })
+    .forEach(doc => print(doc));
+
+// UPDATE саме цього тимчасового
+db.getCollection("bank").updateOne(
+    { _id: tempBankId },
+    { $set: { address: "Updated demo address" } }
+);
+print("Updated temp bank:");
+print(db.getCollection("bank").findOne({ _id: tempBankId }));
+
+// DELETE тимчасового
+db.getCollection("bank").deleteOne({ _id: tempBankId });
+print("Deleted temp bank, should be null now:");
+print(db.getCollection("bank").findOne({ _id: tempBankId }));
+
+// ---------------------------------------------------------------------------
+// 2. CRUD + JOIN: ETF
+// ---------------------------------------------------------------------------
+print("=== CRUD + JOIN: ETF ===");
+
+// для джойну беремо всі ETF і одразу lookup на bank
+db.getCollection("etf").aggregate([
+    {
+        $lookup: {
+            from: "bank",
+            localField: "bankId",
+            foreignField: "_id",
+            as: "bank"
+        }
+    },
+    { $unwind: "$bank" },
+    {
+        $project: {
+            topFundName: 1,
+            status: 1,
+            bankName: "$bank.name",
+            effectiveDate: 1
+        }
+    }
+]).forEach(doc => print(doc));
+
+// CREATE demo ETF
+const cdnBank = db.getCollection("bank").findOne({ swift: "CDNBBCA1" });
+const demoEtfIns = db.getCollection("etf").insertOne({
+    bankId: cdnBank._id,
+    topFundName: "Demo Income Fund",
+    topFundTicker: "DIF",
+    effectiveDate: ISODate("2025-01-01T00:00:00Z"),
+    status: "active",
+    nav: NumberDecimal("99.99"),
+    mer: NumberDecimal("0.0300"),
+    factUrl: "https://demo.example/facts/dif"
+});
+const demoEtfId = demoEtfIns.insertedId;
+print("Inserted demo ETF: " + demoEtfId);
+
+// UPDATE demo ETF
+db.getCollection("etf").updateOne(
+    { _id: demoEtfId },
+    { $set: { status: "inactive" } }
+);
+print("Updated demo ETF:");
+print(db.getCollection("etf").findOne({ _id: demoEtfId }));
+
+// DELETE demo ETF
+db.getCollection("etf").deleteOne({ _id: demoEtfId });
+print("Deleted demo ETF, should be null:");
+print(db.getCollection("etf").findOne({ _id: demoEtfId }));
+
+// ---------------------------------------------------------------------------
+// 3. DISTRIBUTION: CRUD + "latest per ETF"
+// ---------------------------------------------------------------------------
+print("=== DISTRIBUTION: CRUD + latest per ETF ===");
+
+// створимо дистрибуцію для другого ETF
+const dist2Ins = db.getCollection("distribution").insertOne({
+    etfId: etf2Id,
+    recordDate: ISODate("2025-02-15T00:00:00Z"),
+    exDate:     ISODate("2025-02-18T00:00:00Z"),
+    payDate:    ISODate("2025-02-25T00:00:00Z"),
+    amountPerShare: NumberDecimal("0.200"),
+    distType: "dividend",
+    distFreq: "quarterly"
+});
+const dist2Id = dist2Ins.insertedId;
+print("Inserted dist for ETF2: " + dist2Id);
+
+// READ дистрибуцію
+print("Read that distribution:");
+print(db.getCollection("distribution").findOne({ _id: dist2Id }));
+
+// UPDATE
+db.getCollection("distribution").updateOne(
+    { _id: dist2Id },
+    { $set: { amountPerShare: NumberDecimal("0.205") } }
+);
+print("After update:");
+print(db.getCollection("distribution").findOne({ _id: dist2Id }));
+
+// COMPLEX: остання дистрибуція по ВСІХ активних ETF
+print("Latest distribution per active ETF:");
+db.getCollection("etf").aggregate([
+    { $match: { status: "active" } },
+    {
+        $lookup: {
+            from: "distribution",
+            let: { etfId: "$_id" },
+            pipeline: [
+                { $match: { $expr: { $eq: ["$etfId", "$$etfId"] } } },
+                { $sort: { recordDate: -1 } },
+                { $limit: 1 }
+            ],
+            as: "latestDist"
+        }
+    },
+    {
+        $project: {
+            _id: 0,
+            topFundName: 1,
+            latestDist: { $arrayElemAt: ["$latestDist", 0] }
+        }
+    }
+]).forEach(doc => print(doc));
+
+// DELETE тимчасову дистрибуцію щоб не смітити
+db.getCollection("distribution").deleteOne({ _id: dist2Id });
+print("Deleted temp distribution for ETF2");
+
+// ---------------------------------------------------------------------------
+// 4. SECURITY: CRUD + фільтр equity
+// ---------------------------------------------------------------------------
+print("=== SECURITY: CRUD + filter ===");
+
+// CREATE temp security
+const tempSecIns = db.getCollection("security").insertOne({
+    isin: null,
+    cusip: null,
+    sedol: null,
+    name: "Temp Structured Note",
+    secType: "bond",
+    coupon: NumberDecimal("0.020"),
+    maturityDate: ISODate("2032-01-01T00:00:00Z"),
+    rating: "BBB"
+});
+const tempSecId = tempSecIns.insertedId;
+print("Inserted temp security: " + tempSecId);
+
+// READ тільки акції
+print("Equity securities:");
+db.getCollection("security")
+    .find({ secType: "equity" }, { name: 1, isin: 1, secType: 1 })
+    .forEach(doc => print(doc));
+
+// UPDATE temp security
+db.getCollection("security").updateOne(
+    { _id: tempSecId },
+    { $set: { rating: "A-" } }
+);
+print("Updated temp security:");
+print(db.getCollection("security").findOne({ _id: tempSecId }));
+
+// DELETE temp security
+db.getCollection("security").deleteOne({ _id: tempSecId });
+print("Deleted temp security -> should be null:");
+print(db.getCollection("security").findOne({ _id: tempSecId }));
+
+// ---------------------------------------------------------------------------
+// 5. LISTINGS with exchange + currency
+// ---------------------------------------------------------------------------
+print("=== Listings with exchange + currency ===");
+db.getCollection("listing").aggregate([
+    {
+        $lookup: {
+            from: "exchange",
+            localField: "exchangeId",
+            foreignField: "_id",
+            as: "ex"
+        }
+    },
+    { $unwind: "$ex" },
+    {
+        $lookup: {
+            from: "currency",
+            localField: "currencyId",
+            foreignField: "_id",
+            as: "cur"
+        }
+    },
+    { $unwind: "$cur" },
+    {
+        $lookup: {
+            from: "etf",
+            localField: "fundId",
+            foreignField: "_id",
+            as: "fund"
+        }
+    },
+    { $unwind: "$fund" },
+    {
+        $project: {
+            _id: 0,
+            ticker: 1,
+            isPrimary: 1,
+            exchange: "$ex.name",
+            mic: "$ex.mic",
+            currency: "$cur.code",
+            fundName: "$fund.topFundName"
+        }
+    }
+]).forEach(doc => print(doc));
+
+// ---------------------------------------------------------------------------
+// 6. ETFs without listings
+// ---------------------------------------------------------------------------
+print("=== ETFs without listings ===");
+db.getCollection("etf").aggregate([
+    {
+        $lookup: {
+            from: "listing",
+            localField: "_id",
+            foreignField: "fundId",
+            as: "lst"
+        }
+    },
+    { $match: { "lst.0": { $exists: false } } },
+    { $project: { _id: 1, topFundName: 1, status: 1 } }
+]).forEach(doc => print(doc));
+
+// ---------------------------------------------------------------------------
+// 7. INDEX constituents denormalized
+// ---------------------------------------------------------------------------
+print("=== Index constituents with security info ===");
+let demoIndex = db.getCollection("idx").findOne({ name: "Demo World Index" });
+if (!demoIndex) {
+    const insIdx = db.getCollection("idx").insertOne({
+        name: "Demo World Index",
+        provider: "DemoProvider"
+    });
+    demoIndex = db.getCollection("idx").findOne({ _id: insIdx.insertedId });
+    print("Inserted demo index: " + demoIndex._id);
+}
+
+let sec1 = db.getCollection("security").findOne({ isin: "DEMOINDEX001" });
+if (!sec1) {
+    const s1 = db.getCollection("security").insertOne({
+        isin: "DEMOINDEX001",
+        cusip: null,
+        sedol: null,
+        name: "Demo Equity A",
+        secType: "equity",
+        equityName: "DEMA"
+    });
+    sec1 = db.getCollection("security").findOne({ _id: s1.insertedId });
+    print("Inserted demo security 1: " + sec1._id);
+}
+
+let sec2 = db.getCollection("security").findOne({ isin: "DEMOINDEX002" });
+if (!sec2) {
+    const s2 = db.getCollection("security").insertOne({
+        isin: "DEMOINDEX002",
+        cusip: null,
+        sedol: null,
+        name: "Demo Bond B 2035",
+        secType: "bond",
+        coupon: NumberDecimal("0.035"),
+        maturityDate: ISODate("2035-12-31T00:00:00Z"),
+        rating: "A"
+    });
+    sec2 = db.getCollection("security").findOne({ _id: s2.insertedId });
+    print("Inserted demo security 2: " + sec2._id);
+}
+
+const existingConst = db.getCollection("index_constituent").findOne({
+    indexId: demoIndex._id,
+    securityId: sec1._id,
+    asOfDate: ISODate("2025-01-01T00:00:00Z")
+});
+
+if (!existingConst) {
+    db.getCollection("index_constituent").insertMany([
+        {
+            indexId: demoIndex._id,
+            securityId: sec1._id,
+            asOfDate: ISODate("2025-01-01T00:00:00Z"),
+            targetWeight: NumberDecimal("0.060000")
+        },
+        {
+            indexId: demoIndex._id,
+            securityId: sec2._id,
+            asOfDate: ISODate("2025-01-01T00:00:00Z"),
+            targetWeight: NumberDecimal("0.040000")
+        }
+    ]);
+    print("Inserted demo index_constituent rows");
+}
+
+print("=== Index constituents with security info ===");
+db.getCollection("index_constituent").aggregate([
+    {
+        $lookup: {
+            from: "idx",
+            localField: "indexId",
+            foreignField: "_id",
+            as: "index"
+        }
+    },
+    { $unwind: "$index" },
+    {
+        $lookup: {
+            from: "security",
+            localField: "securityId",
+            foreignField: "_id",
+            as: "sec"
+        }
+    },
+    { $unwind: "$sec" },
+    {
+        $project: {
+            _id: 0,
+            indexName: "$index.name",
+            provider: "$index.provider",
+            asOfDate: 1,
+            securityName: "$sec.name",
+            isin: "$sec.isin",
+            targetWeight: 1
+        }
+    },
+    { $sort: { asOfDate: -1, indexName: 1, securityName: 1 } }
+]).forEach(doc => print(doc));
+
+print("=== DEMO DONE ===");
